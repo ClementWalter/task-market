@@ -18,10 +18,11 @@ How do strangers coordinate tasks without trust?
 Every task is a market: "Task X will be completed by time T"
 
 1. **Requester** creates market, stakes USDC on NO
-2. **Deliverer** takes market, stakes USDC on YES, commits proof hash
-3. **Deliverer** completes task, reveals proof
-4. **Slashing period** — anyone can challenge fraudulent proofs
-5. **Settlement** — winner takes both stakes
+2. **Deliverer** takes market, stakes USDC on YES (no commitment yet)
+3. **Deliverer** completes task IRL
+4. **Deliverer** claims delivery with proof hash
+5. **Slashing period** — anyone can challenge fraudulent proofs
+6. **Settlement** — if no slash, deliverer takes both stakes
 
 No platform. No fees (except gas). No trusted third party.
 
@@ -46,23 +47,22 @@ No platform. No fees (except gas). No trusted third party.
 │     └────┬─────┘                                                    │
 │          │                                                          │
 │          │                      2. takeMarket()                     │
-│          │                         commitment: H(proof + salt)      │
 │          │                         stake: 100 USDC (YES)            │
+│          │                         (no commitment yet)              │
 │          │                                   │                      │
 │          ▼                                   ▼                      │
 │     ┌──────────┐                                                    │
-│     │  LOCKED  │◄─────── Both parties committed                     │
+│     │  TAKEN   │◄─────── Deliverer committed to deliver             │
 │     └────┬─────┘                                                    │
 │          │                                                          │
 │          │                      3. [Does the task IRL]              │
 │          │                                                          │
-│          │                      4. revealDelivery()                 │
-│          │                         proof: "photo_hash_xyz"          │
-│          │                         salt: "random123"                │
+│          │                      4. claimDelivery(proofHash)         │
+│          │                         "I did it, here's proof"         │
 │          │                                   │                      │
 │          ▼                                   ▼                      │
 │     ┌──────────┐                                                    │
-│     │ REVEALED │◄─────── Proof public, slashing period starts       │
+│     │ CLAIMED  │◄─────── Proof submitted, slashing period starts    │
 │     └────┬─────┘                                                    │
 │          │                                                          │
 │          │         [1 hour slashing period - anyone can challenge]  │
@@ -127,17 +127,13 @@ function createMarket(
     uint256 deadline        // Unix timestamp
 ) returns (uint256 marketId)
 
-// Take a market (commit to delivering)
-function takeMarket(
-    uint256 marketId,
-    bytes32 commitmentHash  // H(proof + salt)
-)
+// Take a market (stake YES, commit to delivering)
+function takeMarket(uint256 marketId)
 
-// Reveal proof after completing task
-function revealDelivery(
+// Claim delivery after completing task
+function claimDelivery(
     uint256 marketId,
-    bytes32 proof,
-    bytes32 salt
+    bytes32 commitmentHash  // Proof hash (e.g., IPFS hash of photo)
 )
 
 // Claim funds after slashing period
@@ -156,7 +152,7 @@ function claimExpired(uint256 marketId)
 
 | Network | Address | Explorer |
 |---------|---------|----------|
-| Sepolia | `0x3Af8baBa01Fc8dFf7f1f491dFe1Ae74715B54307` | [View](https://sepolia.etherscan.io/address/0x3Af8baBa01Fc8dFf7f1f491dFe1Ae74715B54307) |
+| Sepolia | `0xc6a6002390a9e4b65e570fbf59084421e936aa06` | [View](https://sepolia.etherscan.io/address/0xc6a6002390a9e4b65e570fbf59084421e936aa06) |
 
 ### Prerequisites
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)

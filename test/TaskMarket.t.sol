@@ -61,17 +61,16 @@ contract TaskMarketTest is Test {
         vm.prank(requester);
         uint256 marketId = market.createMarket("Deliver a coffee", STAKE, block.timestamp + 1 hours);
 
-        // Take market
-        bytes32 commitment = keccak256(abi.encodePacked(bytes32("proof"), bytes32("salt")));
-
+        // Take market (no commitment needed now)
         vm.prank(deliverer);
-        market.takeMarket(marketId, commitment);
+        market.takeMarket(marketId);
 
         TaskMarket.Market memory m = market.getMarket(marketId);
 
         assertEq(m.deliverer, deliverer);
-        assertEq(m.commitmentHash, commitment);
-        assertEq(uint256(m.state), uint256(TaskMarket.MarketState.Locked));
+        assertEq(uint256(m.state), uint256(TaskMarket.MarketState.Taken));
+        // No commitment hash at take time
+        assertEq(m.commitmentHash, bytes32(0));
     }
 
     function testFullFlow() public {
@@ -79,25 +78,28 @@ contract TaskMarketTest is Test {
         vm.prank(requester);
         uint256 marketId = market.createMarket("Deliver a coffee", STAKE, block.timestamp + 1 hours);
 
-        // 2. Take market with commitment
-        bytes32 proof = bytes32("delivery_photo_hash_12345");
-        bytes32 salt = bytes32("random_salt_67890");
-        bytes32 commitment = keccak256(abi.encodePacked(proof, salt));
-
+        // 2. Take market (just stake, no commitment)
         vm.prank(deliverer);
-        market.takeMarket(marketId, commitment);
-
-        // 3. Reveal proof
-        vm.prank(deliverer);
-        market.revealDelivery(marketId, proof, salt);
+        market.takeMarket(marketId);
 
         TaskMarket.Market memory m = market.getMarket(marketId);
-        assertEq(uint256(m.state), uint256(TaskMarket.MarketState.Revealed));
+        assertEq(uint256(m.state), uint256(TaskMarket.MarketState.Taken));
 
-        // 4. Wait for slashing period
+        // 3. [Deliverer does the task IRL]
+
+        // 4. Claim delivery with proof hash
+        bytes32 proofHash = keccak256("delivery_photo_ipfs_hash_12345");
+        vm.prank(deliverer);
+        market.claimDelivery(marketId, proofHash);
+
+        m = market.getMarket(marketId);
+        assertEq(uint256(m.state), uint256(TaskMarket.MarketState.Claimed));
+        assertEq(m.commitmentHash, proofHash);
+
+        // 5. Wait for slashing period
         vm.warp(block.timestamp + 2 hours);
 
-        // 5. Claim funds
+        // 6. Claim funds
         uint256 balanceBefore = usdc.balanceOf(deliverer);
 
         vm.prank(deliverer);
@@ -131,9 +133,9 @@ contract TaskMarketTest is Test {
 
         // Take market
         vm.prank(deliverer);
-        market.takeMarket(marketId, bytes32("commitment"));
+        market.takeMarket(marketId);
 
-        // Time passes, deliverer fails to deliver
+        // Time passes, deliverer fails to claim delivery
         vm.warp(block.timestamp + 2 hours);
 
         uint256 balanceBefore = usdc.balanceOf(requester);
@@ -145,5 +147,34 @@ contract TaskMarketTest is Test {
 
         // Requester gets both stakes
         assertEq(balanceAfter - balanceBefore, STAKE * 2);
+    }
+
+    function testCannotClaimBeforeSlashingPeriod() public {
+        vm.prank(requester);
+        uint256 marketId = market.createMarket("Deliver a coffee", STAKE, block.timestamp + 1 hours);
+
+        vm.prank(deliverer);
+        market.takeMarket(marketId);
+
+        vm.prank(deliverer);
+        market.claimDelivery(marketId, keccak256("proof"));
+
+        // Try to claim immediately (should fail)
+        vm.expectRevert(TaskMarket.SlashingPeriodNotOver.selector);
+        vm.prank(deliverer);
+        market.claimFunds(marketId);
+    }
+
+    function testOnlyDelivererCanClaim() public {
+        vm.prank(requester);
+        uint256 marketId = market.createMarket("Deliver a coffee", STAKE, block.timestamp + 1 hours);
+
+        vm.prank(deliverer);
+        market.takeMarket(marketId);
+
+        // Someone else tries to claim delivery
+        vm.expectRevert(TaskMarket.NotDeliverer.selector);
+        vm.prank(requester);
+        market.claimDelivery(marketId, keccak256("proof"));
     }
 }

@@ -12,21 +12,22 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  *
  * Flow:
  * 1. Requester creates market: "I want X done" + stakes USDC on NO
- * 2. Deliverer takes market: commits hash + stakes USDC on YES → market LOCKED
- * 3. Deliverer reveals preimage (proof of delivery)
- * 4. Slashing period: anyone can challenge invalid proofs
- * 5. After timeout: funds released to winner
+ * 2. Deliverer takes market: stakes USDC on YES (no commitment yet)
+ * 3. Deliverer completes task IRL
+ * 4. Deliverer claims delivery: submits commitment hash as proof
+ * 5. Slashing period: anyone can challenge invalid proofs
+ * 6. After timeout: funds released to deliverer
  */
 contract TaskMarket is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ============ Enums ============
     enum MarketState {
-        Open, // Waiting for deliverer
-        Locked, // Deliverer committed, task in progress
-        Revealed, // Proof revealed, in slashing period
+        Open, // Waiting for deliverer to take
+        Taken, // Deliverer staked YES, task in progress
+        Claimed, // Delivery claimed, in slashing period
         Completed, // Funds claimed by deliverer
-        Cancelled, // Requester cancelled (before lock)
+        Cancelled, // Requester cancelled (before take)
         Expired, // Deadline passed, no delivery
         Slashed // Deliverer slashed (future: dispute resolution)
     }
@@ -36,26 +37,21 @@ contract TaskMarket is ReentrancyGuard {
         // Parties
         address requester;
         address deliverer;
-
         // Task details
         string taskDescription;
         uint256 stake; // USDC amount staked by each side
-
         // Timing
         uint256 createdAt;
-        uint256 taskDeadline; // Deliverer must reveal by this time
+        uint256 taskDeadline; // Deliverer must claim by this time
         uint256 slashDeadline; // Challenge period ends here
-
         // Commitment scheme
-        bytes32 commitmentHash; // H(proof + salt) - submitted at take
-        bytes32 revealedProof; // The actual proof, revealed later
-
+        bytes32 commitmentHash; // Proof hash submitted at claim time
         // State
         MarketState state;
     }
 
     // ============ State ============
-    IERC20 public immutable usdc;
+    IERC20 public immutable USDC;
     uint256 public marketCount;
     uint256 public slashingPeriod = 1 hours; // Configurable challenge window
 
@@ -66,9 +62,9 @@ contract TaskMarket is ReentrancyGuard {
         uint256 indexed marketId, address indexed requester, string taskDescription, uint256 stake, uint256 taskDeadline
     );
 
-    event MarketTaken(uint256 indexed marketId, address indexed deliverer, bytes32 commitmentHash);
+    event MarketTaken(uint256 indexed marketId, address indexed deliverer);
 
-    event DeliveryRevealed(uint256 indexed marketId, bytes32 proof, uint256 slashDeadline);
+    event DeliveryClaimed(uint256 indexed marketId, bytes32 commitmentHash, uint256 slashDeadline);
 
     event MarketCompleted(uint256 indexed marketId, address indexed winner, uint256 payout);
 
@@ -83,13 +79,12 @@ contract TaskMarket is ReentrancyGuard {
     error DeadlinePassed();
     error DeadlineNotPassed();
     error SlashingPeriodNotOver();
-    error InvalidCommitment();
     error ZeroStake();
     error ZeroDeadline();
 
     // ============ Constructor ============
     constructor(address _usdc) {
-        usdc = IERC20(_usdc);
+        USDC = IERC20(_usdc);
     }
 
     // ============ Core Functions ============
@@ -119,59 +114,51 @@ contract TaskMarket is ReentrancyGuard {
             taskDeadline: taskDeadline,
             slashDeadline: 0,
             commitmentHash: bytes32(0),
-            revealedProof: bytes32(0),
             state: MarketState.Open
         });
 
         // Transfer stake from requester
-        usdc.safeTransferFrom(msg.sender, address(this), stake);
+        USDC.safeTransferFrom(msg.sender, address(this), stake);
 
         emit MarketCreated(marketId, msg.sender, taskDescription, stake, taskDeadline);
     }
 
     /**
-     * @notice Take a market and commit to delivering
+     * @notice Take a market - stake YES that you'll deliver
      * @param marketId The market to take
-     * @param commitmentHash Hash of (proof + salt) - proves you know the proof before delivering
      */
-    function takeMarket(uint256 marketId, bytes32 commitmentHash) external nonReentrant {
+    function takeMarket(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
 
         if (market.state != MarketState.Open) revert InvalidState();
         if (block.timestamp >= market.taskDeadline) revert DeadlinePassed();
 
         market.deliverer = msg.sender;
-        market.commitmentHash = commitmentHash;
-        market.state = MarketState.Locked;
+        market.state = MarketState.Taken;
 
         // Transfer stake from deliverer
-        usdc.safeTransferFrom(msg.sender, address(this), market.stake);
+        USDC.safeTransferFrom(msg.sender, address(this), market.stake);
 
-        emit MarketTaken(marketId, msg.sender, commitmentHash);
+        emit MarketTaken(marketId, msg.sender);
     }
 
     /**
-     * @notice Reveal the proof of delivery
+     * @notice Claim that delivery is complete - submit proof hash
      * @param marketId The market
-     * @param proof The actual proof (preimage)
-     * @param salt Random salt used in commitment
+     * @param commitmentHash Hash of the proof (e.g., photo, receipt, tx hash)
      */
-    function revealDelivery(uint256 marketId, bytes32 proof, bytes32 salt) external nonReentrant {
+    function claimDelivery(uint256 marketId, bytes32 commitmentHash) external nonReentrant {
         Market storage market = markets[marketId];
 
-        if (market.state != MarketState.Locked) revert InvalidState();
+        if (market.state != MarketState.Taken) revert InvalidState();
         if (msg.sender != market.deliverer) revert NotDeliverer();
         if (block.timestamp > market.taskDeadline) revert DeadlinePassed();
 
-        // Verify commitment
-        bytes32 expectedHash = keccak256(abi.encodePacked(proof, salt));
-        if (expectedHash != market.commitmentHash) revert InvalidCommitment();
-
-        market.revealedProof = proof;
+        market.commitmentHash = commitmentHash;
         market.slashDeadline = block.timestamp + slashingPeriod;
-        market.state = MarketState.Revealed;
+        market.state = MarketState.Claimed;
 
-        emit DeliveryRevealed(marketId, proof, market.slashDeadline);
+        emit DeliveryClaimed(marketId, commitmentHash, market.slashDeadline);
     }
 
     /**
@@ -181,14 +168,14 @@ contract TaskMarket is ReentrancyGuard {
     function claimFunds(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
 
-        if (market.state != MarketState.Revealed) revert InvalidState();
+        if (market.state != MarketState.Claimed) revert InvalidState();
         if (block.timestamp < market.slashDeadline) revert SlashingPeriodNotOver();
 
         market.state = MarketState.Completed;
 
         // Deliverer wins both stakes
         uint256 payout = market.stake * 2;
-        usdc.safeTransfer(market.deliverer, payout);
+        USDC.safeTransfer(market.deliverer, payout);
 
         emit MarketCompleted(marketId, market.deliverer, payout);
     }
@@ -206,33 +193,33 @@ contract TaskMarket is ReentrancyGuard {
         market.state = MarketState.Cancelled;
 
         // Return stake to requester
-        usdc.safeTransfer(market.requester, market.stake);
+        USDC.safeTransfer(market.requester, market.stake);
 
         emit MarketCancelled(marketId);
     }
 
     /**
-     * @notice Claim funds when deliverer failed (deadline passed without reveal)
+     * @notice Claim funds when deliverer failed (deadline passed without claim)
      * @param marketId The market
      */
     function claimExpired(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
 
-        // Can claim if: Locked and deadline passed, OR Open and deadline passed
-        bool isLockedExpired = market.state == MarketState.Locked && block.timestamp > market.taskDeadline;
+        // Can claim if: Taken and deadline passed (no claim), OR Open and deadline passed
+        bool isTakenExpired = market.state == MarketState.Taken && block.timestamp > market.taskDeadline;
         bool isOpenExpired = market.state == MarketState.Open && block.timestamp > market.taskDeadline;
 
-        if (!isLockedExpired && !isOpenExpired) revert InvalidState();
+        if (!isTakenExpired && !isOpenExpired) revert InvalidState();
 
         market.state = MarketState.Expired;
 
-        if (isLockedExpired) {
-            // Requester wins both stakes (deliverer failed)
-            usdc.safeTransfer(market.requester, market.stake * 2);
+        if (isTakenExpired) {
+            // Requester wins both stakes (deliverer failed to claim)
+            USDC.safeTransfer(market.requester, market.stake * 2);
             emit MarketCompleted(marketId, market.requester, market.stake * 2);
         } else {
             // Just return requester's stake (no taker)
-            usdc.safeTransfer(market.requester, market.stake);
+            USDC.safeTransfer(market.requester, market.stake);
             emit MarketCancelled(marketId);
         }
     }
@@ -241,13 +228,7 @@ contract TaskMarket is ReentrancyGuard {
      * @notice Slash a fraudulent delivery (stub for v1 - always reverts)
      * @dev In v2: implement dispute resolution with multi-agent oracle
      */
-    function slash(
-        uint256 marketId,
-        bytes calldata /* evidence */
-    )
-        external
-        pure
-    {
+    function slash(uint256, bytes calldata) external pure {
         // Stub: slashing mechanism designed but not implemented in POC
         // In production: multi-agent oracle votes on validity
         revert("Slashing not implemented in POC");
