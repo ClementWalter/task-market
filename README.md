@@ -17,12 +17,12 @@ How do strangers coordinate tasks without trust?
 
 Every task is a market: "Task X will be completed by time T"
 
-1. **Requester** creates market, stakes USDC on NO
-2. **Deliverer** takes market, stakes USDC on YES (no commitment yet)
-3. **Deliverer** completes task IRL
+1. **Requester** creates market with USDC → mints YES + NO tokens
+2. **Anyone** can buy/sell YES tokens (tradeable prediction market!)
+3. **Deliverer** takes market, commits to completing task
 4. **Deliverer** claims delivery with proof hash
 5. **Slashing period** — anyone can challenge fraudulent proofs
-6. **Settlement** — if no slash, deliverer takes both stakes
+6. **Resolution** — YES or NO wins, token holders redeem for USDC
 
 No platform. No fees (except gas). No trusted third party.
 
@@ -152,7 +152,8 @@ function claimExpired(uint256 marketId)
 
 | Network | Address | Explorer |
 |---------|---------|----------|
-| Sepolia | `0xc6a6002390a9e4b65e570fbf59084421e936aa06` | [View](https://sepolia.etherscan.io/address/0xc6a6002390a9e4b65e570fbf59084421e936aa06) |
+| Sepolia | TaskMarket: `0xd17c07a36033f6193249cadea450d24077b2ed4c` | [View](https://sepolia.etherscan.io/address/0xd17c07a36033f6193249cadea450d24077b2ed4c) |
+| Sepolia | MockCTF: `0xfd1e50b729efebe144c1506532f036a764513cda` | [View](https://sepolia.etherscan.io/address/0xfd1e50b729efebe144c1506532f036a764513cda) |
 
 ### Prerequisites
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)

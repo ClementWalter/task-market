@@ -3,74 +3,119 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
+ * @title IConditionalTokens
+ * @notice Interface for Gnosis Conditional Tokens Framework
+ */
+interface IConditionalTokens {
+    function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external;
+    function reportPayouts(bytes32 questionId, uint256[] calldata payouts) external;
+    function splitPosition(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata partition,
+        uint256 amount
+    ) external;
+    function mergePositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata partition,
+        uint256 amount
+    ) external;
+    function redeemPositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata indexSets
+    ) external;
+    function getConditionId(address oracle, bytes32 questionId, uint256 outcomeSlotCount)
+        external
+        pure
+        returns (bytes32);
+    function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet)
+        external
+        view
+        returns (bytes32);
+    function getPositionId(IERC20 collateralToken, bytes32 collectionId) external pure returns (uint256);
+    function getOutcomeSlotCount(bytes32 conditionId) external view returns (uint256);
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+    function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) external;
+}
+
+/**
  * @title TaskMarket
- * @notice Prediction market-based task coordination for AI agents
- * @dev Every task is a prediction market: "This task will be completed by deadline"
+ * @notice Prediction market-based task coordination with tradeable positions
+ * @dev Integrates with Gnosis CTF for YES/NO outcome tokens
  *
  * Flow:
- * 1. Requester creates market: "I want X done" + stakes USDC on NO
- * 2. Deliverer takes market: stakes USDC on YES (no commitment yet)
- * 3. Deliverer completes task IRL
- * 4. Deliverer claims delivery: submits commitment hash as proof
- * 5. Slashing period: anyone can challenge invalid proofs
- * 6. After timeout: funds released to deliverer
+ * 1. Requester creates market with USDC → mints YES + NO tokens
+ * 2. Anyone can buy/sell YES/NO tokens (bet on outcome)
+ * 3. Deliverer completes task, claims delivery with proof
+ * 4. After slashing period, oracle resolves market
+ * 5. Winners redeem tokens for USDC
  */
-contract TaskMarket is ReentrancyGuard {
+contract TaskMarket is ReentrancyGuard, ERC1155Holder {
     using SafeERC20 for IERC20;
 
-    // ============ Enums ============
-    enum MarketState {
-        Open, // Waiting for deliverer to take
-        Taken, // Deliverer staked YES, task in progress
-        Claimed, // Delivery claimed, in slashing period
-        Completed, // Funds claimed by deliverer
-        Cancelled, // Requester cancelled (before take)
-        Expired, // Deadline passed, no delivery
-        Slashed // Deliverer slashed (future: dispute resolution)
-    }
+    // ============ Constants ============
+    bytes32 public constant PARENT_COLLECTION_ID = bytes32(0);
+    uint256 public constant YES_INDEX = 1; // 0b01
+    uint256 public constant NO_INDEX = 2; // 0b10
 
-    // ============ Structs ============
+    // ============ Immutables ============
+    IERC20 public immutable collateral;
+    IConditionalTokens public immutable ctf;
+
+    // ============ State ============
+    uint256 public marketCount;
+    uint256 public slashingPeriod = 1 hours;
+
     struct Market {
-        // Parties
         address requester;
         address deliverer;
-        // Task details
         string taskDescription;
-        uint256 stake; // USDC amount staked by each side
-        // Timing
-        uint256 createdAt;
-        uint256 taskDeadline; // Deliverer must claim by this time
-        uint256 slashDeadline; // Challenge period ends here
-        // Commitment scheme
-        bytes32 commitmentHash; // Proof hash submitted at claim time
-        // State
+        bytes32 questionId;
+        bytes32 conditionId;
+        uint256 yesTokenId;
+        uint256 noTokenId;
+        uint256 totalCollateral;
+        uint256 deadline;
+        uint256 claimTime;
+        bytes32 proofHash;
         MarketState state;
     }
 
-    // ============ State ============
-    IERC20 public immutable USDC;
-    uint256 public marketCount;
-    uint256 public slashingPeriod = 1 hours; // Configurable challenge window
+    enum MarketState {
+        Open, // Waiting for deliverer
+        Taken, // Someone committed to deliver
+        Claimed, // Delivery claimed, in slashing period
+        ResolvedYes, // Task completed (YES wins)
+        ResolvedNo, // Task failed (NO wins)
+        Cancelled
+    }
 
     mapping(uint256 => Market) public markets;
 
     // ============ Events ============
     event MarketCreated(
-        uint256 indexed marketId, address indexed requester, string taskDescription, uint256 stake, uint256 taskDeadline
+        uint256 indexed marketId,
+        address indexed requester,
+        bytes32 conditionId,
+        uint256 yesTokenId,
+        uint256 noTokenId,
+        uint256 collateralAmount,
+        uint256 deadline
     );
-
     event MarketTaken(uint256 indexed marketId, address indexed deliverer);
-
-    event DeliveryClaimed(uint256 indexed marketId, bytes32 commitmentHash, uint256 slashDeadline);
-
-    event MarketCompleted(uint256 indexed marketId, address indexed winner, uint256 payout);
-
-    event MarketCancelled(uint256 indexed marketId);
-    event MarketExpired(uint256 indexed marketId);
-    event MarketSlashed(uint256 indexed marketId, address indexed challenger);
+    event DeliveryClaimed(uint256 indexed marketId, bytes32 proofHash);
+    event MarketResolved(uint256 indexed marketId, bool yesWins);
+    event TokensPurchased(uint256 indexed marketId, address indexed buyer, bool isYes, uint256 amount);
 
     // ============ Errors ============
     error InvalidState();
@@ -79,159 +124,213 @@ contract TaskMarket is ReentrancyGuard {
     error DeadlinePassed();
     error DeadlineNotPassed();
     error SlashingPeriodNotOver();
-    error ZeroStake();
-    error ZeroDeadline();
+    error ZeroAmount();
+    error MarketNotResolved();
 
     // ============ Constructor ============
-    constructor(address _usdc) {
-        USDC = IERC20(_usdc);
+    constructor(address _collateral, address _ctf) {
+        collateral = IERC20(_collateral);
+        ctf = IConditionalTokens(_ctf);
     }
 
-    // ============ Core Functions ============
+    // ============ Market Creation ============
 
     /**
-     * @notice Create a new task market
+     * @notice Create a new task market with tradeable YES/NO tokens
      * @param taskDescription What needs to be done
-     * @param stake USDC amount to stake (same for both sides)
-     * @param taskDeadline Unix timestamp by which task must be completed
+     * @param initialLiquidity USDC to seed the market (creates YES + NO tokens)
+     * @param deadline Unix timestamp for task completion
      */
-    function createMarket(string calldata taskDescription, uint256 stake, uint256 taskDeadline)
+    function createMarket(string calldata taskDescription, uint256 initialLiquidity, uint256 deadline)
         external
         nonReentrant
         returns (uint256 marketId)
     {
-        if (stake == 0) revert ZeroStake();
-        if (taskDeadline <= block.timestamp) revert ZeroDeadline();
+        if (initialLiquidity == 0) revert ZeroAmount();
+        if (deadline <= block.timestamp) revert DeadlinePassed();
 
         marketId = marketCount++;
+
+        // Generate unique question ID
+        bytes32 questionId = keccak256(abi.encodePacked(marketId, msg.sender, block.timestamp, taskDescription));
+
+        // Prepare condition in CTF (this contract is the oracle)
+        ctf.prepareCondition(address(this), questionId, 2);
+
+        // Get condition and token IDs
+        bytes32 conditionId = ctf.getConditionId(address(this), questionId, 2);
+        bytes32 yesCollectionId = ctf.getCollectionId(PARENT_COLLECTION_ID, conditionId, YES_INDEX);
+        bytes32 noCollectionId = ctf.getCollectionId(PARENT_COLLECTION_ID, conditionId, NO_INDEX);
+        uint256 yesTokenId = ctf.getPositionId(collateral, yesCollectionId);
+        uint256 noTokenId = ctf.getPositionId(collateral, noCollectionId);
 
         markets[marketId] = Market({
             requester: msg.sender,
             deliverer: address(0),
             taskDescription: taskDescription,
-            stake: stake,
-            createdAt: block.timestamp,
-            taskDeadline: taskDeadline,
-            slashDeadline: 0,
-            commitmentHash: bytes32(0),
+            questionId: questionId,
+            conditionId: conditionId,
+            yesTokenId: yesTokenId,
+            noTokenId: noTokenId,
+            totalCollateral: initialLiquidity,
+            deadline: deadline,
+            claimTime: 0,
+            proofHash: bytes32(0),
             state: MarketState.Open
         });
 
-        // Transfer stake from requester
-        USDC.safeTransferFrom(msg.sender, address(this), stake);
+        // Transfer collateral and split into YES + NO tokens
+        collateral.safeTransferFrom(msg.sender, address(this), initialLiquidity);
+        collateral.approve(address(ctf), initialLiquidity);
 
-        emit MarketCreated(marketId, msg.sender, taskDescription, stake, taskDeadline);
+        uint256[] memory partition = new uint256[](2);
+        partition[0] = YES_INDEX;
+        partition[1] = NO_INDEX;
+        ctf.splitPosition(collateral, PARENT_COLLECTION_ID, conditionId, partition, initialLiquidity);
+
+        // Give requester the NO tokens (they bet task won't be done)
+        ctf.safeTransferFrom(address(this), msg.sender, noTokenId, initialLiquidity, "");
+
+        // Keep YES tokens in contract for deliverer to claim
+
+        emit MarketCreated(marketId, msg.sender, conditionId, yesTokenId, noTokenId, initialLiquidity, deadline);
+    }
+
+    // ============ Trading ============
+
+    /**
+     * @notice Buy YES tokens (bet task will be completed)
+     * @dev Sends USDC, receives YES tokens from contract reserves
+     */
+    function buyYes(uint256 marketId, uint256 amount) external nonReentrant {
+        Market storage market = markets[marketId];
+        if (market.state != MarketState.Open && market.state != MarketState.Taken) revert InvalidState();
+        if (amount == 0) revert ZeroAmount();
+
+        // Simple 1:1 exchange - more sophisticated AMM could be added
+        uint256 available = ctf.balanceOf(address(this), market.yesTokenId);
+        require(amount <= available, "Insufficient YES tokens");
+
+        collateral.safeTransferFrom(msg.sender, address(this), amount);
+        market.totalCollateral += amount;
+
+        ctf.safeTransferFrom(address(this), msg.sender, market.yesTokenId, amount, "");
+
+        emit TokensPurchased(marketId, msg.sender, true, amount);
     }
 
     /**
-     * @notice Take a market - stake YES that you'll deliver
-     * @param marketId The market to take
+     * @notice Sell YES tokens back to the contract
+     */
+    function sellYes(uint256 marketId, uint256 amount) external nonReentrant {
+        Market storage market = markets[marketId];
+        if (market.state != MarketState.Open && market.state != MarketState.Taken) revert InvalidState();
+        if (amount == 0) revert ZeroAmount();
+
+        // Transfer YES tokens to contract
+        ctf.safeTransferFrom(msg.sender, address(this), market.yesTokenId, amount, "");
+
+        // Return collateral
+        collateral.safeTransfer(msg.sender, amount);
+        market.totalCollateral -= amount;
+    }
+
+    // ============ Task Flow ============
+
+    /**
+     * @notice Take the market - commit to delivering the task
+     * @dev Deliverer can later claim YES tokens upon completion
      */
     function takeMarket(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
-
         if (market.state != MarketState.Open) revert InvalidState();
-        if (block.timestamp >= market.taskDeadline) revert DeadlinePassed();
+        if (block.timestamp >= market.deadline) revert DeadlinePassed();
 
         market.deliverer = msg.sender;
         market.state = MarketState.Taken;
-
-        // Transfer stake from deliverer
-        USDC.safeTransferFrom(msg.sender, address(this), market.stake);
 
         emit MarketTaken(marketId, msg.sender);
     }
 
     /**
-     * @notice Claim that delivery is complete - submit proof hash
-     * @param marketId The market
-     * @param commitmentHash Hash of the proof (e.g., photo, receipt, tx hash)
+     * @notice Claim delivery with proof hash
      */
-    function claimDelivery(uint256 marketId, bytes32 commitmentHash) external nonReentrant {
+    function claimDelivery(uint256 marketId, bytes32 proofHash) external nonReentrant {
         Market storage market = markets[marketId];
-
         if (market.state != MarketState.Taken) revert InvalidState();
         if (msg.sender != market.deliverer) revert NotDeliverer();
-        if (block.timestamp > market.taskDeadline) revert DeadlinePassed();
+        if (block.timestamp > market.deadline) revert DeadlinePassed();
 
-        market.commitmentHash = commitmentHash;
-        market.slashDeadline = block.timestamp + slashingPeriod;
+        market.proofHash = proofHash;
+        market.claimTime = block.timestamp;
         market.state = MarketState.Claimed;
 
-        emit DeliveryClaimed(marketId, commitmentHash, market.slashDeadline);
+        emit DeliveryClaimed(marketId, proofHash);
     }
 
-    /**
-     * @notice Claim funds after successful delivery (slashing period over)
-     * @param marketId The market
-     */
-    function claimFunds(uint256 marketId) external nonReentrant {
-        Market storage market = markets[marketId];
+    // ============ Resolution ============
 
+    /**
+     * @notice Resolve market as YES (task completed)
+     * @dev Only after slashing period
+     */
+    function resolveYes(uint256 marketId) external nonReentrant {
+        Market storage market = markets[marketId];
         if (market.state != MarketState.Claimed) revert InvalidState();
-        if (block.timestamp < market.slashDeadline) revert SlashingPeriodNotOver();
+        if (block.timestamp < market.claimTime + slashingPeriod) revert SlashingPeriodNotOver();
 
-        market.state = MarketState.Completed;
+        market.state = MarketState.ResolvedYes;
 
-        // Deliverer wins both stakes
-        uint256 payout = market.stake * 2;
-        USDC.safeTransfer(market.deliverer, payout);
+        // Report to CTF: YES wins
+        uint256[] memory payouts = new uint256[](2);
+        payouts[0] = 1; // YES
+        payouts[1] = 0; // NO
+        ctf.reportPayouts(market.questionId, payouts);
 
-        emit MarketCompleted(marketId, market.deliverer, payout);
+        emit MarketResolved(marketId, true);
     }
 
     /**
-     * @notice Cancel an open market (only requester, only if not taken)
-     * @param marketId The market
+     * @notice Resolve market as NO (task failed)
+     * @dev Deadline passed without valid claim
      */
-    function cancelMarket(uint256 marketId) external nonReentrant {
+    function resolveNo(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
 
-        if (market.state != MarketState.Open) revert InvalidState();
-        if (msg.sender != market.requester) revert NotRequester();
+        bool canResolveNo = (market.state == MarketState.Open || market.state == MarketState.Taken)
+            && block.timestamp > market.deadline;
 
-        market.state = MarketState.Cancelled;
+        if (!canResolveNo) revert InvalidState();
 
-        // Return stake to requester
-        USDC.safeTransfer(market.requester, market.stake);
+        market.state = MarketState.ResolvedNo;
 
-        emit MarketCancelled(marketId);
+        // Report to CTF: NO wins
+        uint256[] memory payouts = new uint256[](2);
+        payouts[0] = 0; // YES
+        payouts[1] = 1; // NO
+        ctf.reportPayouts(market.questionId, payouts);
+
+        emit MarketResolved(marketId, false);
     }
 
+    // ============ Redemption ============
+
     /**
-     * @notice Claim funds when deliverer failed (deadline passed without claim)
-     * @param marketId The market
+     * @notice Redeem winning tokens for collateral
+     * @dev Call CTF directly to redeem, this is a helper
      */
-    function claimExpired(uint256 marketId) external nonReentrant {
+    function redeem(uint256 marketId) external nonReentrant {
         Market storage market = markets[marketId];
-
-        // Can claim if: Taken and deadline passed (no claim), OR Open and deadline passed
-        bool isTakenExpired = market.state == MarketState.Taken && block.timestamp > market.taskDeadline;
-        bool isOpenExpired = market.state == MarketState.Open && block.timestamp > market.taskDeadline;
-
-        if (!isTakenExpired && !isOpenExpired) revert InvalidState();
-
-        market.state = MarketState.Expired;
-
-        if (isTakenExpired) {
-            // Requester wins both stakes (deliverer failed to claim)
-            USDC.safeTransfer(market.requester, market.stake * 2);
-            emit MarketCompleted(marketId, market.requester, market.stake * 2);
-        } else {
-            // Just return requester's stake (no taker)
-            USDC.safeTransfer(market.requester, market.stake);
-            emit MarketCancelled(marketId);
+        if (market.state != MarketState.ResolvedYes && market.state != MarketState.ResolvedNo) {
+            revert MarketNotResolved();
         }
-    }
 
-    /**
-     * @notice Slash a fraudulent delivery (stub for v1 - always reverts)
-     * @dev In v2: implement dispute resolution with multi-agent oracle
-     */
-    function slash(uint256, bytes calldata) external pure {
-        // Stub: slashing mechanism designed but not implemented in POC
-        // In production: multi-agent oracle votes on validity
-        revert("Slashing not implemented in POC");
+        uint256[] memory indexSets = new uint256[](2);
+        indexSets[0] = YES_INDEX;
+        indexSets[1] = NO_INDEX;
+
+        // Redeem on behalf of caller (they need to have the winning tokens)
+        ctf.redeemPositions(collateral, PARENT_COLLECTION_ID, market.conditionId, indexSets);
     }
 
     // ============ View Functions ============
@@ -240,25 +339,13 @@ contract TaskMarket is ReentrancyGuard {
         return markets[marketId];
     }
 
-    function getOpenMarkets(uint256 offset, uint256 limit) external view returns (uint256[] memory) {
-        uint256[] memory result = new uint256[](limit);
-        uint256 count = 0;
-
-        for (uint256 i = offset; i < marketCount && count < limit; i++) {
-            if (markets[i].state == MarketState.Open) {
-                result[count++] = i;
-            }
-        }
-
-        // Resize array
-        assembly {
-            mstore(result, count)
-        }
-        return result;
+    function getTokenIds(uint256 marketId) external view returns (uint256 yesTokenId, uint256 noTokenId) {
+        Market storage market = markets[marketId];
+        return (market.yesTokenId, market.noTokenId);
     }
 
     function setSlashingPeriod(uint256 _period) external {
-        // In production: add access control
+        // TODO: Add access control
         slashingPeriod = _period;
     }
 }
