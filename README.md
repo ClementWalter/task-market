@@ -152,6 +152,12 @@ function claimExpired(uint256 marketId)
 
 ## 🚀 Deployment
 
+### Live Contracts
+
+| Network | Address | Explorer |
+|---------|---------|----------|
+| Sepolia | `0x3Af8baBa01Fc8dFf7f1f491dFe1Ae74715B54307` | [View](https://sepolia.etherscan.io/address/0x3Af8baBa01Fc8dFf7f1f491dFe1Ae74715B54307) |
+
 ### Prerequisites
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)
 - Testnet ETH (Sepolia or Base Sepolia)
